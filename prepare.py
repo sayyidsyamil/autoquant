@@ -1,389 +1,221 @@
 """
-One-time data preparation for autoresearch experiments.
-Downloads data shards and trains a BPE tokenizer.
+Fixed data and evaluation utilities for AutoQuant experiments.
+
+AutoQuant uses yfinance daily price data for Bursa Malaysia stocks and scores
+experiments by out-of-sample annualized Sharpe ratio. Higher val_sharpe is better.
 
 Usage:
-    python prepare.py                  # full prep (download + tokenizer)
-    python prepare.py --num-shards 8   # download only 8 shards (for testing)
-
-Data and tokenizer are stored in ~/.cache/autoresearch/.
+    uv run prepare.py                 # download/cache the default universe
+    uv run prepare.py --refresh       # force a fresh yfinance download
 """
 
-import os
-import sys
-import time
-import math
+from __future__ import annotations
+
 import argparse
-import pickle
-from multiprocessing import Pool
+import os
+from dataclasses import dataclass
+from datetime import date
+from pathlib import Path
+from typing import Iterable
 
-import requests
-import pyarrow.parquet as pq
-import rustbpe
-import tiktoken
-import torch
-
-# ---------------------------------------------------------------------------
-# Constants (fixed, do not modify)
-# ---------------------------------------------------------------------------
-
-MAX_SEQ_LEN = 2048       # context length
-TIME_BUDGET = 300        # training time budget in seconds (5 minutes)
-EVAL_TOKENS = 40 * 524288  # number of tokens for val eval
+import numpy as np
+import pandas as pd
+import yfinance as yf
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Constants (fixed evaluation harness)
 # ---------------------------------------------------------------------------
 
-CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch")
-DATA_DIR = os.path.join(CACHE_DIR, "data")
-TOKENIZER_DIR = os.path.join(CACHE_DIR, "tokenizer")
-BASE_URL = "https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle/resolve/main"
-MAX_SHARD = 6542 # the last datashard is shard_06542.parquet
-VAL_SHARD = MAX_SHARD  # pinned validation shard (shard_06542)
-VAL_FILENAME = f"shard_{VAL_SHARD:05d}.parquet"
-VOCAB_SIZE = 8192
+CACHE_DIR = Path(os.path.expanduser("~")) / ".cache" / "autoquant"
+PRICE_CACHE = CACHE_DIR / "malaysia_prices.csv"
 
-# BPE split pattern (GPT-4 style, with \p{N}{1,2} instead of {1,3})
-SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
+START_DATE = "2020-01-01"
+END_DATE = date.today().isoformat()
+TRAIN_END_DATE = "2024-12-31"
+RISK_FREE_RATE = 0.03
+TRADING_DAYS = 252
+MIN_OBSERVATIONS = 252
 
-SPECIAL_TOKENS = [f"<|reserved_{i}|>" for i in range(4)]
-BOS_TOKEN = "<|reserved_0|>"
-
-# ---------------------------------------------------------------------------
-# Data download
-# ---------------------------------------------------------------------------
-
-def download_single_shard(index):
-    """Download one parquet shard with retries. Returns True on success."""
-    filename = f"shard_{index:05d}.parquet"
-    filepath = os.path.join(DATA_DIR, filename)
-    if os.path.exists(filepath):
-        return True
-
-    url = f"{BASE_URL}/{filename}"
-    max_attempts = 5
-    for attempt in range(1, max_attempts + 1):
-        try:
-            response = requests.get(url, stream=True, timeout=30)
-            response.raise_for_status()
-            temp_path = filepath + ".tmp"
-            with open(temp_path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
-            os.rename(temp_path, filepath)
-            print(f"  Downloaded {filename}")
-            return True
-        except (requests.RequestException, IOError) as e:
-            print(f"  Attempt {attempt}/{max_attempts} failed for {filename}: {e}")
-            for path in [filepath + ".tmp", filepath]:
-                if os.path.exists(path):
-                    try:
-                        os.remove(path)
-                    except OSError:
-                        pass
-            if attempt < max_attempts:
-                time.sleep(2 ** attempt)
-    return False
+DEFAULT_TICKERS = [
+    "1155.KL",  # Malayan Banking
+    "1023.KL",  # CIMB Group
+    "1295.KL",  # Public Bank
+    "5819.KL",  # Hong Leong Bank
+    "1066.KL",  # RHB Bank
+    "5347.KL",  # Tenaga Nasional
+    "4863.KL",  # Telekom Malaysia
+    "6947.KL",  # CelcomDigi
+    "5225.KL",  # IHH Healthcare
+    "5183.KL",  # Petronas Chemicals
+    "6033.KL",  # Petronas Gas
+    "5681.KL",  # Petronas Dagangan
+    "3816.KL",  # MISC
+    "7277.KL",  # Dialog Group
+    "1961.KL",  # IOI Corp
+    "2445.KL",  # Kuala Lumpur Kepong
+    "5285.KL",  # Sime Darby Plantation
+    "4197.KL",  # Sime Darby
+    "4707.KL",  # Nestle Malaysia
+    "5296.KL",  # MR DIY
+    "7113.KL",  # Top Glove
+    "5168.KL",  # Hartalega
+]
 
 
-def download_data(num_shards, download_workers=8):
-    """Download training shards + pinned validation shard."""
-    os.makedirs(DATA_DIR, exist_ok=True)
-    num_train = min(num_shards, MAX_SHARD)
-    ids = list(range(num_train))
-    if VAL_SHARD not in ids:
-        ids.append(VAL_SHARD)
-
-    # Count what's already downloaded
-    existing = sum(1 for i in ids if os.path.exists(os.path.join(DATA_DIR, f"shard_{i:05d}.parquet")))
-    if existing == len(ids):
-        print(f"Data: all {len(ids)} shards already downloaded at {DATA_DIR}")
-        return
-
-    needed = len(ids) - existing
-    print(f"Data: downloading {needed} shards ({existing} already exist)...")
-
-    workers = max(1, min(download_workers, needed))
-    with Pool(processes=workers) as pool:
-        results = pool.map(download_single_shard, ids)
-
-    ok = sum(1 for r in results if r)
-    print(f"Data: {ok}/{len(ids)} shards ready at {DATA_DIR}")
-
-# ---------------------------------------------------------------------------
-# Tokenizer training
-# ---------------------------------------------------------------------------
-
-def list_parquet_files():
-    """Return sorted list of parquet file paths in the data directory."""
-    files = sorted(f for f in os.listdir(DATA_DIR) if f.endswith(".parquet") and not f.endswith(".tmp"))
-    return [os.path.join(DATA_DIR, f) for f in files]
+@dataclass(frozen=True)
+class PortfolioReport:
+    val_sharpe: float
+    train_sharpe: float
+    annual_return: float
+    annual_volatility: float
+    max_drawdown: float
+    cumulative_return: float
+    num_assets: int
+    start: str
+    end: str
 
 
-def text_iterator(max_chars=1_000_000_000, doc_cap=10_000):
-    """Yield documents from training split (all shards except pinned val shard)."""
-    parquet_paths = [p for p in list_parquet_files() if not p.endswith(VAL_FILENAME)]
-    nchars = 0
-    for filepath in parquet_paths:
-        pf = pq.ParquetFile(filepath)
-        for rg_idx in range(pf.num_row_groups):
-            rg = pf.read_row_group(rg_idx)
-            for text in rg.column("text").to_pylist():
-                doc = text[:doc_cap] if len(text) > doc_cap else text
-                nchars += len(doc)
-                yield doc
-                if nchars >= max_chars:
-                    return
+def download_prices(
+    tickers: Iterable[str] = DEFAULT_TICKERS,
+    start: str = START_DATE,
+    end: str = END_DATE,
+    refresh: bool = False,
+) -> pd.DataFrame:
+    """Download adjusted daily close prices and cache them as CSV."""
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    if PRICE_CACHE.exists() and not refresh:
+        return load_prices()
+
+    symbols = sorted(set(tickers))
+    raw = yf.download(
+        symbols,
+        start=start,
+        end=end,
+        auto_adjust=True,
+        progress=False,
+        group_by="column",
+        threads=True,
+    )
+    if raw.empty:
+        raise RuntimeError("yfinance returned no price data for the configured universe")
+
+    prices = raw["Close"] if isinstance(raw.columns, pd.MultiIndex) else raw[["Close"]]
+    if not isinstance(prices, pd.DataFrame):
+        prices = prices.to_frame()
+    if len(symbols) == 1:
+        prices.columns = symbols
+
+    prices = clean_prices(prices)
+    if prices.empty:
+        raise RuntimeError("no usable price series remained after cleaning")
+
+    prices.to_csv(PRICE_CACHE, index_label="Date")
+    return prices
 
 
-def train_tokenizer():
-    """Train BPE tokenizer using rustbpe, save as tiktoken pickle."""
-    tokenizer_pkl = os.path.join(TOKENIZER_DIR, "tokenizer.pkl")
-    token_bytes_path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
+def clean_prices(prices: pd.DataFrame) -> pd.DataFrame:
+    """Keep liquid-enough columns and forward-fill occasional market holidays."""
+    prices = prices.copy()
+    prices.index = pd.to_datetime(prices.index)
+    prices = prices.sort_index()
+    prices = prices.dropna(axis=1, thresh=MIN_OBSERVATIONS)
+    prices = prices.ffill(limit=5).dropna(axis=0, how="all")
+    prices = prices.dropna(axis=1)
+    prices = prices.loc[:, prices.nunique() > 1]
+    return prices
 
-    if os.path.exists(tokenizer_pkl) and os.path.exists(token_bytes_path):
-        print(f"Tokenizer: already trained at {TOKENIZER_DIR}")
-        return
 
-    os.makedirs(TOKENIZER_DIR, exist_ok=True)
+def load_prices() -> pd.DataFrame:
+    if not PRICE_CACHE.exists():
+        return download_prices(refresh=True)
+    prices = pd.read_csv(PRICE_CACHE, index_col="Date", parse_dates=True)
+    return clean_prices(prices)
 
-    parquet_files = list_parquet_files()
-    if len(parquet_files) < 2:
-        print("Tokenizer: need at least 2 data shards (1 train + 1 val). Download more data first.")
-        sys.exit(1)
 
-    # --- Train with rustbpe ---
-    print("Tokenizer: training BPE tokenizer...")
-    t0 = time.time()
+def daily_returns(prices: pd.DataFrame) -> pd.DataFrame:
+    returns = prices.pct_change(fill_method=None).replace([np.inf, -np.inf], np.nan)
+    return returns.dropna(axis=0, how="all").dropna(axis=1)
 
-    tokenizer = rustbpe.Tokenizer()
-    vocab_size_no_special = VOCAB_SIZE - len(SPECIAL_TOKENS)
-    tokenizer.train_from_iterator(text_iterator(), vocab_size_no_special, pattern=SPLIT_PATTERN)
 
-    # Build tiktoken encoding from trained merges
-    pattern = tokenizer.get_pattern()
-    mergeable_ranks = {bytes(k): v for k, v in tokenizer.get_mergeable_ranks()}
-    tokens_offset = len(mergeable_ranks)
-    special_tokens = {name: tokens_offset + i for i, name in enumerate(SPECIAL_TOKENS)}
-    enc = tiktoken.Encoding(
-        name="rustbpe",
-        pat_str=pattern,
-        mergeable_ranks=mergeable_ranks,
-        special_tokens=special_tokens,
+def train_val_split(returns: pd.DataFrame, train_end: str = TRAIN_END_DATE) -> tuple[pd.DataFrame, pd.DataFrame]:
+    train = returns.loc[:train_end]
+    val = returns.loc[pd.Timestamp(train_end) + pd.Timedelta(days=1):]
+    if len(train) < MIN_OBSERVATIONS:
+        raise RuntimeError(f"train split too small: {len(train)} rows")
+    if len(val) < 30:
+        raise RuntimeError(f"validation split too small: {len(val)} rows")
+    common = train.columns.intersection(val.columns)
+    return train[common].dropna(axis=1), val[common].dropna(axis=1)
+
+
+def normalize_weights(weights: pd.Series | dict[str, float], columns: Iterable[str]) -> pd.Series:
+    weights = pd.Series(weights, dtype=float).reindex(list(columns)).fillna(0.0)
+    weights = weights.clip(lower=0.0)
+    total = float(weights.sum())
+    if not np.isfinite(total) or total <= 0:
+        raise ValueError("portfolio weights must contain at least one positive finite value")
+    return weights / total
+
+
+def portfolio_returns(returns: pd.DataFrame, weights: pd.Series | dict[str, float]) -> pd.Series:
+    w = normalize_weights(weights, returns.columns)
+    aligned = returns[w.index].dropna(axis=0, how="any")
+    return aligned @ w
+
+
+def annualized_sharpe(series: pd.Series, risk_free_rate: float = RISK_FREE_RATE) -> float:
+    series = series.dropna()
+    if len(series) < 2:
+        return float("nan")
+    daily_excess = series - risk_free_rate / TRADING_DAYS
+    vol = float(daily_excess.std(ddof=1))
+    if not np.isfinite(vol) or vol == 0:
+        return float("nan")
+    return float(np.sqrt(TRADING_DAYS) * daily_excess.mean() / vol)
+
+
+def max_drawdown(series: pd.Series) -> float:
+    equity = (1.0 + series.dropna()).cumprod()
+    if equity.empty:
+        return float("nan")
+    drawdown = equity / equity.cummax() - 1.0
+    return float(drawdown.min())
+
+
+def evaluate_portfolio(
+    weights: pd.Series | dict[str, float],
+    train_returns: pd.DataFrame,
+    val_returns: pd.DataFrame,
+) -> PortfolioReport:
+    train_p = portfolio_returns(train_returns, weights)
+    val_p = portfolio_returns(val_returns, weights)
+    return PortfolioReport(
+        val_sharpe=annualized_sharpe(val_p),
+        train_sharpe=annualized_sharpe(train_p),
+        annual_return=float(val_p.mean() * TRADING_DAYS),
+        annual_volatility=float(val_p.std(ddof=1) * np.sqrt(TRADING_DAYS)),
+        max_drawdown=max_drawdown(val_p),
+        cumulative_return=float((1.0 + val_p).prod() - 1.0),
+        num_assets=int((normalize_weights(weights, val_returns.columns) > 0).sum()),
+        start=val_p.index.min().date().isoformat(),
+        end=val_p.index.max().date().isoformat(),
     )
 
-    # Save tokenizer
-    with open(tokenizer_pkl, "wb") as f:
-        pickle.dump(enc, f)
 
-    t1 = time.time()
-    print(f"Tokenizer: trained in {t1 - t0:.1f}s, saved to {tokenizer_pkl}")
-
-    # --- Build token_bytes lookup for BPB evaluation ---
-    print("Tokenizer: building token_bytes lookup...")
-    special_set = set(SPECIAL_TOKENS)
-    token_bytes_list = []
-    for token_id in range(enc.n_vocab):
-        token_str = enc.decode([token_id])
-        if token_str in special_set:
-            token_bytes_list.append(0)
-        else:
-            token_bytes_list.append(len(token_str.encode("utf-8")))
-    token_bytes_tensor = torch.tensor(token_bytes_list, dtype=torch.int32)
-    torch.save(token_bytes_tensor, token_bytes_path)
-    print(f"Tokenizer: saved token_bytes to {token_bytes_path}")
-
-    # Sanity check
-    test = "Hello world! Numbers: 123. Unicode: 你好"
-    encoded = enc.encode_ordinary(test)
-    decoded = enc.decode(encoded)
-    assert decoded == test, f"Tokenizer roundtrip failed: {test!r} -> {decoded!r}"
-    print(f"Tokenizer: sanity check passed (vocab_size={enc.n_vocab})")
-
-# ---------------------------------------------------------------------------
-# Runtime utilities (imported by train.py)
-# ---------------------------------------------------------------------------
-
-class Tokenizer:
-    """Minimal tokenizer wrapper. Training is handled above."""
-
-    def __init__(self, enc):
-        self.enc = enc
-        self.bos_token_id = enc.encode_single_token(BOS_TOKEN)
-
-    @classmethod
-    def from_directory(cls, tokenizer_dir=TOKENIZER_DIR):
-        with open(os.path.join(tokenizer_dir, "tokenizer.pkl"), "rb") as f:
-            enc = pickle.load(f)
-        return cls(enc)
-
-    def get_vocab_size(self):
-        return self.enc.n_vocab
-
-    def get_bos_token_id(self):
-        return self.bos_token_id
-
-    def encode(self, text, prepend=None, num_threads=8):
-        if prepend is not None:
-            prepend_id = prepend if isinstance(prepend, int) else self.enc.encode_single_token(prepend)
-        if isinstance(text, str):
-            ids = self.enc.encode_ordinary(text)
-            if prepend is not None:
-                ids.insert(0, prepend_id)
-        elif isinstance(text, list):
-            ids = self.enc.encode_ordinary_batch(text, num_threads=num_threads)
-            if prepend is not None:
-                for row in ids:
-                    row.insert(0, prepend_id)
-        else:
-            raise ValueError(f"Invalid input type: {type(text)}")
-        return ids
-
-    def decode(self, ids):
-        return self.enc.decode(ids)
-
-
-def get_token_bytes(device="cpu"):
-    path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
-    with open(path, "rb") as f:
-        return torch.load(f, map_location=device)
-
-
-def _document_batches(split, tokenizer_batch_size=128):
-    """Infinite iterator over document batches from parquet files."""
-    parquet_paths = list_parquet_files()
-    assert len(parquet_paths) > 0, "No parquet files found. Run prepare.py first."
-    val_path = os.path.join(DATA_DIR, VAL_FILENAME)
-    if split == "train":
-        parquet_paths = [p for p in parquet_paths if p != val_path]
-        assert len(parquet_paths) > 0, "No training shards found."
-    else:
-        parquet_paths = [val_path]
-    epoch = 1
-    while True:
-        for filepath in parquet_paths:
-            pf = pq.ParquetFile(filepath)
-            for rg_idx in range(pf.num_row_groups):
-                rg = pf.read_row_group(rg_idx)
-                batch = rg.column('text').to_pylist()
-                for i in range(0, len(batch), tokenizer_batch_size):
-                    yield batch[i:i+tokenizer_batch_size], epoch
-        epoch += 1
-
-
-def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
-    """
-    BOS-aligned dataloader with best-fit packing.
-    Every row starts with BOS. Documents packed using best-fit to minimize cropping.
-    When no document fits remaining space, crops shortest doc to fill exactly.
-    100% utilization (no padding).
-    """
-    assert split in ["train", "val"]
-    row_capacity = T + 1
-    batches = _document_batches(split)
-    bos_token = tokenizer.get_bos_token_id()
-    doc_buffer = []
-    epoch = 1
-
-    def refill_buffer():
-        nonlocal epoch
-        doc_batch, epoch = next(batches)
-        token_lists = tokenizer.encode(doc_batch, prepend=bos_token)
-        doc_buffer.extend(token_lists)
-
-    # Pre-allocate buffers: [inputs (B*T) | targets (B*T)]
-    row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
-    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=True)
-    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device="cuda")
-    cpu_inputs = cpu_buffer[:B * T].view(B, T)
-    cpu_targets = cpu_buffer[B * T:].view(B, T)
-    inputs = gpu_buffer[:B * T].view(B, T)
-    targets = gpu_buffer[B * T:].view(B, T)
-
-    while True:
-        for row_idx in range(B):
-            pos = 0
-            while pos < row_capacity:
-                while len(doc_buffer) < buffer_size:
-                    refill_buffer()
-
-                remaining = row_capacity - pos
-
-                # Find largest doc that fits entirely
-                best_idx = -1
-                best_len = 0
-                for i, doc in enumerate(doc_buffer):
-                    doc_len = len(doc)
-                    if doc_len <= remaining and doc_len > best_len:
-                        best_idx = i
-                        best_len = doc_len
-
-                if best_idx >= 0:
-                    doc = doc_buffer.pop(best_idx)
-                    row_buffer[row_idx, pos:pos + len(doc)] = torch.tensor(doc, dtype=torch.long)
-                    pos += len(doc)
-                else:
-                    # No doc fits — crop shortest to fill remaining
-                    shortest_idx = min(range(len(doc_buffer)), key=lambda i: len(doc_buffer[i]))
-                    doc = doc_buffer.pop(shortest_idx)
-                    row_buffer[row_idx, pos:pos + remaining] = torch.tensor(doc[:remaining], dtype=torch.long)
-                    pos += remaining
-
-        cpu_inputs.copy_(row_buffer[:, :-1])
-        cpu_targets.copy_(row_buffer[:, 1:])
-        gpu_buffer.copy_(cpu_buffer, non_blocking=True)
-        yield inputs, targets, epoch
-
-# ---------------------------------------------------------------------------
-# Evaluation (DO NOT CHANGE — this is the fixed metric)
-# ---------------------------------------------------------------------------
-
-@torch.no_grad()
-def evaluate_bpb(model, tokenizer, batch_size):
-    """
-    Bits per byte (BPB): vocab size-independent evaluation metric.
-    Sums per-token cross-entropy (in nats), sums target byte lengths,
-    then converts nats/byte to bits/byte. Special tokens (byte length 0)
-    are excluded from both sums.
-    Uses fixed MAX_SEQ_LEN so results are comparable across configs.
-    """
-    token_bytes = get_token_bytes(device="cuda")
-    val_loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, "val")
-    steps = EVAL_TOKENS // (batch_size * MAX_SEQ_LEN)
-    total_nats = 0.0
-    total_bytes = 0
-    for _ in range(steps):
-        x, y, _ = next(val_loader)
-        loss_flat = model(x, y, reduction='none').view(-1)
-        y_flat = y.view(-1)
-        nbytes = token_bytes[y_flat]
-        mask = nbytes > 0
-        total_nats += (loss_flat * mask).sum().item()
-        total_bytes += nbytes.sum().item()
-    return total_nats / (math.log(2) * total_bytes)
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Prepare data and tokenizer for autoresearch")
-    parser.add_argument("--num-shards", type=int, default=10, help="Number of training shards to download (-1 = all). Val shard is always pinned.")
-    parser.add_argument("--download-workers", type=int, default=8, help="Number of parallel download workers")
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--refresh", action="store_true", help="force a fresh yfinance download")
     args = parser.parse_args()
 
-    num_shards = MAX_SHARD if args.num_shards == -1 else args.num_shards
+    prices = download_prices(refresh=args.refresh)
+    returns = daily_returns(prices)
+    train, val = train_val_split(returns)
+    print(f"AutoQuant cache: {PRICE_CACHE}")
+    print(f"Tickers ready: {len(prices.columns)}")
+    print(f"Date range: {prices.index.min().date()} to {prices.index.max().date()}")
+    print(f"Train rows: {len(train)}")
+    print(f"Validation rows: {len(val)}")
 
-    print(f"Cache directory: {CACHE_DIR}")
-    print()
 
-    # Step 1: Download data
-    download_data(num_shards, download_workers=args.download_workers)
-    print()
-
-    # Step 2: Train tokenizer
-    train_tokenizer()
-    print()
-    print("Done! Ready to train.")
+if __name__ == "__main__":
+    main()
