@@ -23,13 +23,12 @@ a fixed training budget. This fork swaps the domain and metric:
 
 This is research code, not financial advice.
 
-## How it works
+## How It Works
 
-The project keeps the small three-file shape:
+The project keeps a small public surface:
 
 - `prepare.py` - fixed data download, cache, returns, and evaluation utilities.
 - `train.py` - the editable strategy experiment. Change ranking, weighting, and search logic here.
-- `program.md` - operating instructions for an autonomous agent running experiments.
 
 By default, `prepare.py` caches adjusted close data under `~/.cache/autoquant/`.
 The validation split starts after `2024-12-31`, so experiments optimize on older
