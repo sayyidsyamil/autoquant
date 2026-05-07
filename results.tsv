@@ -1,0 +1,7 @@
+run	commit	val_sharpe	max_drawdown	status	description
+1	5349c2e	0.809002	-0.073616	keep	public baseline
+2	public-01	0.759475	-0.093243	trial	equal-weight top 8
+3	public-02	0.35331	-0.106016	discard	momentum-heavy top 6
+4	public-03	0.646923	-0.094895	trial	trailing-sharpe top 6
+5	public-04	0.882952	-0.078222	keep	low-correlation basket
+6	private	1.7	undisclosed	private	proprietary no-sentiment strategy

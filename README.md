@@ -13,6 +13,8 @@ Using a proprietary strategy on top of this setup, I managed to push the result
 to about **1.7 Sharpe** without using news sentiment. The method is intentionally
 not disclosed here. This repo is the harness, not the secret sauce.
 
+![AutoQuant Sharpe results](results_sharpe.png)
+
 The original upstream repo optimized validation bits per byte (`val_bpb`) after
 a fixed training budget. This fork swaps the domain and metric:
 
@@ -70,11 +72,12 @@ total_seconds:     21.4
 
 ## Logging Results
 
-Use `results.tsv` for local experiment notes. It is ignored by git.
+See `results.tsv` for the small public result log used by the chart.
 
 ```text
-commit	val_sharpe	max_drawdown	status	description
-abc1234	1.234567	-0.080000	keep	baseline inverse-vol top momentum basket
+run	commit	val_sharpe	max_drawdown	status	description
+1	5349c2e	0.809002	-0.073616	keep	public baseline
+6	private	1.700000	undisclosed	private	proprietary no-sentiment strategy
 ```
 
 ## License
