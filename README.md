@@ -1,10 +1,20 @@
 # autoquant
 
 AutoQuant is a fork of `karpathy/autoresearch` adapted from autonomous LLM
-pretraining experiments into autonomous quant research.
+pretraining experiments into autonomous quant research for Bursa Malaysia.
 
-The original repo optimized validation bits per byte (`val_bpb`) after a fixed
-training budget. This fork swaps the domain and metric:
+The public scaffold here is simple: pull Malaysia stock data from `yfinance`,
+run repeatable portfolio experiments, and score them by out-of-sample Sharpe
+ratio. The interesting part is what this setup is for: testing whether an
+agentic research loop can keep improving a local market strategy without
+turning the whole thing into a black-box notebook mess.
+
+Using a proprietary strategy on top of this setup, I managed to push the result
+to about **1.7 Sharpe** without using news sentiment. The method is intentionally
+not disclosed here. This repo is the harness, not the secret sauce.
+
+The original upstream repo optimized validation bits per byte (`val_bpb`) after
+a fixed training budget. This fork swaps the domain and metric:
 
 - Data source: `yfinance`
 - Market: Bursa Malaysia stocks (`.KL` tickers)
